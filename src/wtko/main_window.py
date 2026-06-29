@@ -1,0 +1,442 @@
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+from PySide6.QtCore import QTimer, Qt, Signal
+from PySide6.QtGui import QCloseEvent, QDesktopServices
+from PySide6.QtCore import QUrl
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
+    QFileDialog,
+    QFormLayout,
+    QGridLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QLineEdit,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QScrollArea,
+    QSpinBox,
+    QTabWidget,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+
+from .models import AppConfig
+from .paths import app_data_dir
+from .widgets import LevelEditor, PositionEditor
+
+
+class MainWindow(QMainWindow):
+    startRequested = Signal()
+    stopRequested = Signal()
+    saveRequested = Signal()
+    previewRequested = Signal(int)
+    sequenceRequested = Signal()
+    chooseMediaRequested = Signal(int)
+    chooseSoundRequested = Signal(int)
+    exitRequested = Signal()
+
+    def __init__(self, config: AppConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.force_close = False
+        self._loading = True
+
+        self.setWindowTitle("战争雷霆击杀提示")
+        self.resize(1120, 760)
+        self.setMinimumSize(920, 650)
+
+        self.tabs = QTabWidget()
+        self.setCentralWidget(self.tabs)
+
+        self._build_dashboard()
+        self._build_levels()
+        self._build_position()
+        self._build_settings()
+        self._build_logs()
+
+        self._load_config_to_controls()
+        self._loading = False
+
+        self.auto_save_timer = QTimer(self)
+        self.auto_save_timer.setSingleShot(True)
+        self.auto_save_timer.timeout.connect(self.saveRequested.emit)
+
+    def _build_dashboard(self) -> None:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        title = QLabel("WTKillOverlay")
+        title.setObjectName("pageTitle")
+        subtitle = QLabel("关注B站升仙的黄老仙谢谢喵~")
+        subtitle.setObjectName("muted")
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+
+        status_box = QGroupBox("运行状态")
+        status_layout = QGridLayout(status_box)
+
+        self.connection_status = QLabel("未启动")
+        self.listener_status = QLabel("已停止")
+        self.last_message = QLabel("暂无")
+        self.last_message.setWordWrap(True)
+
+        status_layout.addWidget(QLabel("8111 接口"), 0, 0)
+        status_layout.addWidget(self.connection_status, 0, 1)
+        status_layout.addWidget(QLabel("监听器"), 1, 0)
+        status_layout.addWidget(self.listener_status, 1, 1)
+        status_layout.addWidget(QLabel("最近 HUD 消息"), 2, 0)
+        status_layout.addWidget(self.last_message, 2, 1)
+
+        layout.addWidget(status_box)
+
+        buttons = QHBoxLayout()
+        self.start_button = QPushButton("启动监听")
+        self.start_button.setObjectName("primaryButton")
+        self.stop_button = QPushButton("停止监听")
+        preview_one = QPushButton("预览一杀")
+        sequence = QPushButton("演示 1→5")
+
+        buttons.addWidget(self.start_button)
+        buttons.addWidget(self.stop_button)
+        buttons.addWidget(preview_one)
+        buttons.addWidget(sequence)
+        buttons.addStretch()
+        layout.addLayout(buttons)
+
+        notice = QLabel(
+            "注：使用无边框全屏或窗口化。"
+        )
+        notice.setWordWrap(True)
+        notice.setObjectName("notice")
+        layout.addWidget(notice)
+        layout.addStretch()
+
+        self.start_button.clicked.connect(self.startRequested.emit)
+        self.stop_button.clicked.connect(self.stopRequested.emit)
+        preview_one.clicked.connect(lambda: self.previewRequested.emit(1))
+        sequence.clicked.connect(self.sequenceRequested.emit)
+
+        self.tabs.addTab(page, "控制台")
+
+    def _build_levels(self) -> None:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QWidget()
+        layout = QVBoxLayout(container)
+
+        intro = QLabel(
+            "每个连杀等级可使用不同图片、GIF、视频与音效。"
+        )
+        intro.setWordWrap(True)
+        intro.setObjectName("muted")
+        layout.addWidget(intro)
+
+        self.level_editors: dict[int, LevelEditor] = {}
+        for level in range(1, 6):
+            editor = LevelEditor(level, self.config.levels[str(level)])
+            editor.changed.connect(lambda _level: self.schedule_save())
+            editor.chooseMedia.connect(self.chooseMediaRequested.emit)
+            editor.chooseSound.connect(self.chooseSoundRequested.emit)
+            editor.preview.connect(self.previewRequested.emit)
+            layout.addWidget(editor)
+            self.level_editors[level] = editor
+
+        layout.addStretch()
+        scroll.setWidget(container)
+        self.tabs.addTab(scroll, "连杀素材")
+
+    def _build_position(self) -> None:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        self.position_editor = PositionEditor()
+        layout.addWidget(self.position_editor, 1)
+
+        controls = QGridLayout()
+
+        self.screen_combo = QComboBox()
+        self.refresh_screens()
+
+        self.x_spin = QDoubleSpinBox()
+        self.x_spin.setRange(0.0, 100.0)
+        self.x_spin.setSuffix("%")
+        self.x_spin.setDecimals(1)
+
+        self.y_spin = QDoubleSpinBox()
+        self.y_spin.setRange(0.0, 100.0)
+        self.y_spin.setSuffix("%")
+        self.y_spin.setDecimals(1)
+
+        self.base_size_spin = QSpinBox()
+        self.base_size_spin.setRange(120, 1400)
+        self.base_size_spin.setSuffix(" px")
+
+        self.global_scale_spin = QDoubleSpinBox()
+        self.global_scale_spin.setRange(0.3, 2.0)
+        self.global_scale_spin.setSingleStep(0.05)
+
+        self.opacity_spin = QDoubleSpinBox()
+        self.opacity_spin.setRange(0.1, 1.0)
+        self.opacity_spin.setSingleStep(0.05)
+
+        actual_preview = QPushButton("在实际屏幕预览一杀")
+        reset = QPushButton("恢复默认位置")
+
+        controls.addWidget(QLabel("显示器"), 0, 0)
+        controls.addWidget(self.screen_combo, 0, 1)
+        controls.addWidget(QLabel("X"), 0, 2)
+        controls.addWidget(self.x_spin, 0, 3)
+        controls.addWidget(QLabel("Y"), 0, 4)
+        controls.addWidget(self.y_spin, 0, 5)
+
+        controls.addWidget(QLabel("基础尺寸"), 1, 0)
+        controls.addWidget(self.base_size_spin, 1, 1)
+        controls.addWidget(QLabel("全局缩放"), 1, 2)
+        controls.addWidget(self.global_scale_spin, 1, 3)
+        controls.addWidget(QLabel("透明度"), 1, 4)
+        controls.addWidget(self.opacity_spin, 1, 5)
+
+        controls.addWidget(actual_preview, 2, 0, 1, 3)
+        controls.addWidget(reset, 2, 3, 1, 3)
+        layout.addLayout(controls)
+
+        self.position_editor.positionChanged.connect(self._editor_position_changed)
+        self.x_spin.valueChanged.connect(self._spin_position_changed)
+        self.y_spin.valueChanged.connect(self._spin_position_changed)
+        self.screen_combo.currentIndexChanged.connect(lambda _v: self.schedule_save())
+        self.base_size_spin.valueChanged.connect(lambda _v: self.schedule_save())
+        self.global_scale_spin.valueChanged.connect(self._global_scale_changed)
+        self.opacity_spin.valueChanged.connect(lambda _v: self.schedule_save())
+        actual_preview.clicked.connect(lambda: self.previewRequested.emit(1))
+        reset.clicked.connect(self._reset_position)
+
+        self.tabs.addTab(page, "位置与显示")
+
+    def _build_settings(self) -> None:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        form_box = QGroupBox("游戏监听")
+        form = QFormLayout(form_box)
+
+        self.player_name_edit = QLineEdit()
+        self.player_name_edit.setPlaceholderText("填写游戏中显示的完整昵称")
+        self.base_url_edit = QLineEdit()
+        self.poll_spin = QSpinBox()
+        self.poll_spin.setRange(80, 2000)
+        self.poll_spin.setSuffix(" ms")
+
+        self.combo_timeout_spin = QSpinBox()
+        self.combo_timeout_spin.setRange(500, 30000)
+        self.combo_timeout_spin.setSuffix(" ms")
+
+        self.keywords_edit = QTextEdit()
+        self.keywords_edit.setPlaceholderText("每行一个关键词")
+        self.keywords_edit.setMaximumHeight(180)
+
+        form.addRow("玩家昵称", self.player_name_edit)
+        form.addRow("8111 地址", self.base_url_edit)
+        form.addRow("轮询间隔", self.poll_spin)
+        form.addRow("连杀时间窗", self.combo_timeout_spin)
+        form.addRow("击杀关键词", self.keywords_edit)
+
+        layout.addWidget(form_box)
+
+        general_box = QGroupBox("程序行为")
+        general_layout = QVBoxLayout(general_box)
+        self.minimize_tray_check = QCheckBox("关闭主窗口时最小化到系统托盘")
+        self.auto_start_listener_check = QCheckBox("程序启动后自动监听")
+        general_layout.addWidget(self.minimize_tray_check)
+        general_layout.addWidget(self.auto_start_listener_check)
+        layout.addWidget(general_box)
+
+        save_button = QPushButton("立即保存设置")
+        save_button.setObjectName("primaryButton")
+        save_button.clicked.connect(self.saveRequested.emit)
+        layout.addWidget(save_button)
+        layout.addStretch()
+
+        for widget_signal in (
+            self.player_name_edit.textChanged,
+            self.base_url_edit.textChanged,
+            self.poll_spin.valueChanged,
+            self.combo_timeout_spin.valueChanged,
+            self.keywords_edit.textChanged,
+            self.minimize_tray_check.toggled,
+            self.auto_start_listener_check.toggled,
+        ):
+            widget_signal.connect(lambda *_args: self.schedule_save())
+
+        self.tabs.addTab(page, "设置")
+
+    def _build_logs(self) -> None:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+
+        self.log_edit = QTextEdit()
+        self.log_edit.setReadOnly(True)
+        self.log_edit.setLineWrapMode(QTextEdit.LineWrapMode.NoWrap)
+        layout.addWidget(self.log_edit, 1)
+
+        buttons = QHBoxLayout()
+        clear = QPushButton("清空界面日志")
+        open_folder = QPushButton("打开数据目录")
+        buttons.addWidget(clear)
+        buttons.addWidget(open_folder)
+        buttons.addStretch()
+        layout.addLayout(buttons)
+
+        clear.clicked.connect(self.log_edit.clear)
+        open_folder.clicked.connect(
+            lambda: QDesktopServices.openUrl(
+                QUrl.fromLocalFile(str(app_data_dir()))
+            )
+        )
+
+        self.tabs.addTab(page, "日志")
+
+    def _load_config_to_controls(self) -> None:
+        config = self.config
+
+        self.player_name_edit.setText(config.game.player_name)
+        self.base_url_edit.setText(config.game.base_url)
+        self.poll_spin.setValue(config.game.poll_interval_ms)
+        self.combo_timeout_spin.setValue(config.combo.timeout_ms)
+        self.keywords_edit.setPlainText("\n".join(config.game.kill_keywords))
+        self.minimize_tray_check.setChecked(config.general.minimize_to_tray)
+        self.auto_start_listener_check.setChecked(
+            config.general.start_listening_on_launch
+        )
+
+        self.screen_combo.setCurrentIndex(
+            max(0, min(config.overlay.screen_index, self.screen_combo.count() - 1))
+        )
+        self.x_spin.setValue(config.overlay.x_ratio * 100)
+        self.y_spin.setValue(config.overlay.y_ratio * 100)
+        self.base_size_spin.setValue(config.overlay.base_size_px)
+        self.global_scale_spin.setValue(config.overlay.global_scale)
+        self.opacity_spin.setValue(config.overlay.opacity)
+
+        self.position_editor.set_position(
+            config.overlay.x_ratio,
+            config.overlay.y_ratio,
+        )
+        self.position_editor.set_item_scale(config.overlay.global_scale)
+
+    def refresh_screens(self) -> None:
+        self.screen_combo.clear()
+        for index, screen in enumerate(QApplication.screens()):
+            geometry = screen.geometry()
+            self.screen_combo.addItem(
+                f"{index + 1}: {screen.name()} "
+                f"({geometry.width()}×{geometry.height()})"
+            )
+
+    def apply_controls_to_config(self) -> AppConfig:
+        self.config.game.player_name = self.player_name_edit.text().strip()
+        self.config.game.base_url = self.base_url_edit.text().strip().rstrip("/")
+        self.config.game.poll_interval_ms = self.poll_spin.value()
+        self.config.game.kill_keywords = [
+            line.strip()
+            for line in self.keywords_edit.toPlainText().splitlines()
+            if line.strip()
+        ]
+
+        self.config.combo.timeout_ms = self.combo_timeout_spin.value()
+
+        self.config.overlay.screen_index = max(self.screen_combo.currentIndex(), 0)
+        self.config.overlay.x_ratio = self.x_spin.value() / 100
+        self.config.overlay.y_ratio = self.y_spin.value() / 100
+        self.config.overlay.base_size_px = self.base_size_spin.value()
+        self.config.overlay.global_scale = self.global_scale_spin.value()
+        self.config.overlay.opacity = self.opacity_spin.value()
+
+        self.config.general.minimize_to_tray = self.minimize_tray_check.isChecked()
+        self.config.general.start_listening_on_launch = (
+            self.auto_start_listener_check.isChecked()
+        )
+
+        for level, editor in self.level_editors.items():
+            self.config.levels[str(level)] = editor.get_config()
+
+        return self.config
+
+    def schedule_save(self) -> None:
+        if not self._loading and hasattr(self, "auto_save_timer"):
+            self.auto_save_timer.start(450)
+
+    def set_connection_status(self, connected: bool, detail: str) -> None:
+        self.connection_status.setText("已连接" if connected else "未连接")
+        self.connection_status.setProperty("connected", connected)
+        self.connection_status.style().unpolish(self.connection_status)
+        self.connection_status.style().polish(self.connection_status)
+        if detail:
+            self.connection_status.setToolTip(detail)
+
+    def set_listener_running(self, running: bool) -> None:
+        self.listener_status.setText("运行中" if running else "已停止")
+        self.start_button.setEnabled(not running)
+        self.stop_button.setEnabled(running)
+
+    def set_last_message(self, message: str) -> None:
+        self.last_message.setText(message)
+
+    def append_log(self, text: str) -> None:
+        self.log_edit.append(text)
+
+    def set_media_path(self, level: int, path: str) -> None:
+        self.level_editors[level].set_media_path(path)
+
+    def set_sound_path(self, level: int, path: str) -> None:
+        self.level_editors[level].set_sound_path(path)
+
+    def _editor_position_changed(self, x_ratio: float, y_ratio: float) -> None:
+        self.x_spin.blockSignals(True)
+        self.y_spin.blockSignals(True)
+        self.x_spin.setValue(x_ratio * 100)
+        self.y_spin.setValue(y_ratio * 100)
+        self.x_spin.blockSignals(False)
+        self.y_spin.blockSignals(False)
+        self.schedule_save()
+
+    def _spin_position_changed(self, _value: float) -> None:
+        self.position_editor.set_position(
+            self.x_spin.value() / 100,
+            self.y_spin.value() / 100,
+        )
+        self.schedule_save()
+
+    def _global_scale_changed(self, value: float) -> None:
+        self.position_editor.set_item_scale(value)
+        self.schedule_save()
+
+    def _reset_position(self) -> None:
+        self.x_spin.setValue(50.0)
+        self.y_spin.setValue(28.0)
+        self.global_scale_spin.setValue(1.0)
+        self.opacity_spin.setValue(1.0)
+        self.schedule_save()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        if not self.force_close and self.config.general.minimize_to_tray:
+            self.hide()
+            event.ignore()
+            return
+        if not self.force_close:
+            self.exitRequested.emit()
+        event.accept()
+
+    def show_error(self, title: str, message: str) -> None:
+        QMessageBox.critical(self, title, message)
+
+    def show_info(self, title: str, message: str) -> None:
+        QMessageBox.information(self, title, message)
