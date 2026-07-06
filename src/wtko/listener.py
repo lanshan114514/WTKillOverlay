@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import threading
-import time
 from typing import Any
 import urllib.parse
 import urllib.request
@@ -19,7 +18,7 @@ class ListenerSettings:
     kill_keywords: tuple[str, ...]
 
 
-from .parser import extract_hud_items, item_id, is_own_kill
+from .parser import extract_hud_items, is_own_kill, item_id
 
 
 class WarThunderListener(QThread):
@@ -27,13 +26,13 @@ class WarThunderListener(QThread):
     rawMessage = Signal(str)
     killDetected = Signal(str)
     diagnostic = Signal(str)
+    gameReset = Signal()
 
     def __init__(self, settings: ListenerSettings) -> None:
         super().__init__()
         self._settings = settings
         self._settings_lock = threading.Lock()
         self._stop_event = threading.Event()
-
         self._last_event_id = 0
         self._last_damage_id = 0
         self._synced = False
@@ -58,7 +57,6 @@ class WarThunderListener(QThread):
     def run(self) -> None:
         while not self._stop_event.is_set():
             settings = self._settings_snapshot()
-
             try:
                 payload = self._request(settings)
                 self._set_connected(True, "已连接 8111 接口")
@@ -78,17 +76,14 @@ class WarThunderListener(QThread):
     def _request(self, settings: ListenerSettings) -> dict[str, Any]:
         base = settings.base_url.rstrip("/")
         query = urllib.parse.urlencode(
-            {
-                "lastEvt": self._last_event_id,
-                "lastDmg": self._last_damage_id,
-            }
+            {"lastEvt": self._last_event_id, "lastDmg": self._last_damage_id}
         )
-        request = urllib.request.Request(
+        req = urllib.request.Request(
             f"{base}/hudmsg?{query}",
             headers={"User-Agent": "WTKillOverlay/0.1"},
         )
-        with urllib.request.urlopen(request, timeout=0.9) as response:
-            raw = response.read().decode("utf-8", errors="replace")
+        with urllib.request.urlopen(req, timeout=0.9) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
         payload = json.loads(raw)
         if not isinstance(payload, dict):
             raise ValueError("hudmsg 返回的不是 JSON 对象")
@@ -101,42 +96,28 @@ class WarThunderListener(QThread):
     ) -> None:
         events, damage = extract_hud_items(payload)
 
-        new_event_items = [
-            item for item in events if item_id(item) > self._last_event_id
-        ]
-        new_damage_items = [
-            item for item in damage if item_id(item) > self._last_damage_id
-        ]
+        new_event_items = [i for i in events if item_id(i) > self._last_event_id]
+        new_damage_items = [i for i in damage if item_id(i) > self._last_damage_id]
 
         if events:
             self._last_event_id = max(
-                self._last_event_id,
-                max(item_id(item) for item in events),
+                self._last_event_id, max(item_id(i) for i in events)
             )
         if damage:
             self._last_damage_id = max(
-                self._last_damage_id,
-                max(item_id(item) for item in damage),
+                self._last_damage_id, max(item_id(i) for i in damage)
             )
 
         if not self._synced:
             self._synced = True
             self.diagnostic.emit("已同步当前 HUD 消息游标，后续新消息将参与判断。")
+            self.gameReset.emit()
             return
 
-        for item in sorted(
-            [*new_event_items, *new_damage_items],
-            key=item_id,
-        ):
+        for item in sorted([*new_event_items, *new_damage_items], key=item_id):
             message = str(item.get("msg", "")).strip()
             if not message:
                 continue
-
             self.rawMessage.emit(message)
-
-            if is_own_kill(
-                message,
-                settings.player_name,
-                settings.kill_keywords,
-            ):
+            if is_own_kill(message, settings.player_name, settings.kill_keywords):
                 self.killDetected.emit(message)

@@ -18,6 +18,7 @@ from .config import ConfigManager
 from .listener import ListenerSettings, WarThunderListener
 from .main_window import MainWindow
 from .media import AudioPlayer
+from .mouse_listener import MouseClickWorker
 from .overlay import OverlayWindow
 from .paths import config_path, logs_dir, resolve_data_path, resource_path
 
@@ -40,6 +41,16 @@ class ApplicationController(QObject):
         self.last_kill_time = 0.0
         self.sequence_level = 0
 
+        # 鼠标点击状态
+        self._mouse_holding = False
+        self._mouse_loop_timer = QTimer(self)
+        self._mouse_loop_timer.setSingleShot(False)
+        self._mouse_loop_timer.timeout.connect(self._on_mouse_loop_tick)
+
+        self._mouse_worker = MouseClickWorker(self)
+        self._mouse_worker.leftPressed.connect(self._on_mouse_pressed)
+        self._mouse_worker.leftReleased.connect(self._on_mouse_released)
+
         self._connect_signals()
         self._create_tray()
         self._apply_style()
@@ -52,6 +63,9 @@ class ApplicationController(QObject):
         if self.config.general.start_listening_on_launch:
             QTimer.singleShot(300, self.start_listener)
 
+        # 鼠标监听始终启动（不需要 WT 连接）
+        self._mouse_worker.start()
+
     def _connect_signals(self) -> None:
         self.window.startRequested.connect(self.start_listener)
         self.window.stopRequested.connect(self.stop_listener)
@@ -61,12 +75,16 @@ class ApplicationController(QObject):
         self.window.chooseMediaRequested.connect(self.choose_media)
         self.window.chooseSoundRequested.connect(self.choose_sound)
         self.window.exitRequested.connect(self.exit_application)
+        self.window.resetComboRequested.connect(self.reset_combo)
+        self.window.chooseMouseMediaRequested.connect(self.choose_mouse_media)
+        self.window.chooseMouseSoundRequested.connect(self.choose_mouse_sound)
+        self.window.previewMouseClickRequested.connect(self._play_mouse_click_once)
 
         self.overlay.playbackFailed.connect(
             lambda text: self.log(f"播放失败：{text}")
         )
         self.overlay.playbackStarted.connect(
-            lambda level: self.log(f"开始显示 {level} 杀素材。")
+            lambda level: self.log(f"开始显示 {level} 杀素材。") if level > 0 else None
         )
         self.audio.error.connect(
             lambda text: self.log(f"音频错误：{text}")
@@ -134,7 +152,7 @@ class ApplicationController(QObject):
         if not self.config.game.player_name:
             self.window.show_error(
                 "缺少玩家昵称",
-                "请先在“设置”页面填写游戏中的完整昵称。",
+                "请先在【设置】页面填写游戏中的完整昵称。",
             )
             return
 
@@ -145,6 +163,7 @@ class ApplicationController(QObject):
         self.listener.connectionChanged.connect(self._connection_changed)
         self.listener.rawMessage.connect(self._raw_message)
         self.listener.killDetected.connect(self._kill_detected)
+        self.listener.gameReset.connect(self._on_game_reset)
         self.listener.diagnostic.connect(
             lambda text: self.log(f"诊断：{text}")
         )
@@ -188,52 +207,55 @@ class ApplicationController(QObject):
 
     def _kill_detected(self, message: str) -> None:
         now = time.monotonic()
-        if (
+        infinite = self.config.combo.infinite_timeout
+        if infinite:
+            self.combo_count = self.combo_count + 1 if self.last_kill_time > 0 else 1
+        elif (
             self.last_kill_time > 0
-            and (now - self.last_kill_time) * 1000
-            <= self.config.combo.timeout_ms
+            and (now - self.last_kill_time) * 1000 <= self.config.combo.timeout_ms
         ):
             self.combo_count += 1
         else:
             self.combo_count = 1
 
         self.last_kill_time = now
+        self.window.update_combo_display(self.combo_count)
         resolved = self.resolve_level(self.combo_count)
         self.log(
-            f"检测到本人击杀，当前连杀 {self.combo_count}，"
-            f"使用 {resolved} 杀素材。"
+            f"检测到本人击杀，当前连杀 {self.combo_count}，使用 {resolved} 杀素材。"
         )
         self.play_level(resolved)
 
-    def resolve_level(self, combo: int) -> int:
-        enabled_levels = [
-            level
-            for level in range(1, 6)
-            if self.config.levels[str(level)].enabled
-        ]
+    def reset_combo(self) -> None:
+        self.combo_count = 0
+        self.last_kill_time = 0.0
+        self.window.update_combo_display(0)
+        self.log("连杀计数已重置。")
 
+    def _on_game_reset(self) -> None:
+        if self.combo_count > 0:
+            self.log("检测到游戏重置，连杀计数已清零。")
+        self.reset_combo()
+
+    def resolve_level(self, combo: int) -> int:
+        enabled_levels = sorted(
+            int(k)
+            for k, v in self.config.levels.items()
+            if k.isdigit() and v.enabled
+        )
         if not enabled_levels:
             return 1
-
-        matching = [level for level in enabled_levels if level <= combo]
-        if matching:
-            return max(matching)
-
-        return min(enabled_levels)
+        matching = [lvl for lvl in enabled_levels if lvl <= combo]
+        return max(matching) if matching else min(enabled_levels)
 
     def play_level(self, level: int) -> None:
         self.config = self.window.apply_controls_to_config()
         level_config = self.config.levels[str(level)]
-
-        self.overlay.play_level(
-            level,
-            level_config,
-            self.config.overlay,
-        )
-
-        sound_path = resolve_data_path(level_config.sound)
+        if not level_config.enabled:
+            return
+        self.overlay.play_level(level, level_config, self.config.overlay)
         if level_config.sound:
-            self.audio.play(sound_path, level_config.volume)
+            self.audio.play(resolve_data_path(level_config.sound), level_config.volume)
 
     def preview_level(self, level: int) -> None:
         self.log(f"手动预览 {level} 杀。")
@@ -244,27 +266,104 @@ class ApplicationController(QObject):
         self._play_next_sequence_level()
 
     def _play_next_sequence_level(self) -> None:
-        if self.sequence_level > 5:
+        max_level = max((int(k) for k in self.config.levels if k.isdigit()), default=5)
+        if self.sequence_level > max_level:
             return
-
         self.preview_level(self.sequence_level)
         self.sequence_level += 1
         QTimer.singleShot(1700, self._play_next_sequence_level)
+
+    # ── 鼠标点击 ─────────────────────────────────────────────────────────
+
+    def _on_mouse_pressed(self) -> None:
+        # 仅在监听器运行期间生效
+        if self.listener is None or not self.listener.isRunning():
+            return
+
+        self.config = self.window.apply_controls_to_config()
+        mc = self.config.mouse_click
+        if not mc.enabled:
+            return
+
+        self._mouse_holding = True
+        self._play_mouse_click_once()
+
+        if mc.loop_on_hold:
+            interval = max(50, mc.duration_ms)
+            self._mouse_loop_timer.setInterval(interval)
+            self._mouse_loop_timer.start()
+
+    def _on_mouse_released(self) -> None:
+        self._mouse_holding = False
+        self._mouse_loop_timer.stop()
+
+    def _on_mouse_loop_tick(self) -> None:
+        if not self._mouse_holding:
+            self._mouse_loop_timer.stop()
+            return
+        self._play_mouse_click_once()
+
+    def _play_mouse_click_once(self) -> None:
+        self.config = self.window.apply_controls_to_config()
+        mc = self.config.mouse_click
+        if not mc.enabled:
+            return
+
+        self.overlay.play_generic(
+            media=mc.media,
+            duration_ms=mc.duration_ms,
+            chroma_key=mc.chroma_key,
+            scale=mc.scale,
+            overlay_config=self.config.overlay,
+        )
+        if mc.sound:
+            self.audio.play(resolve_data_path(mc.sound), mc.volume)
+
+    def choose_mouse_media(self) -> None:
+        filters = (
+            "媒体文件 (*.png *.jpg *.jpeg *.bmp *.webp *.gif "
+            "*.mp4 *.webm *.mov *.mkv *.avi)"
+        )
+        filename, _ = QFileDialog.getOpenFileName(
+            self.window, "选择鼠标点击图片或视频", str(Path.home()), filters
+        )
+        if not filename:
+            return
+        try:
+            stored = self.asset_service.import_media(Path(filename))
+            self.window.set_mouse_media_path(stored)
+            self.save_config()
+            self.log(f"已导入鼠标点击素材：{stored}")
+        except Exception as exc:
+            self.window.show_error("素材导入失败", str(exc))
+
+    def choose_mouse_sound(self) -> None:
+        filters = "音频文件 (*.wav *.mp3 *.ogg *.flac *.m4a)"
+        filename, _ = QFileDialog.getOpenFileName(
+            self.window, "选择鼠标点击音效", str(Path.home()), filters
+        )
+        if not filename:
+            return
+        try:
+            stored = self.asset_service.import_audio(Path(filename))
+            self.window.set_mouse_sound_path(stored)
+            self.save_config()
+            self.log(f"已导入鼠标点击音效：{stored}")
+        except Exception as exc:
+            self.window.show_error("音效导入失败", str(exc))
+
+    # ── 连杀素材文件选择 ──────────────────────────────────────────────────
 
     def choose_media(self, level: int) -> None:
         filters = (
             "媒体文件 (*.png *.jpg *.jpeg *.bmp *.webp *.gif "
             "*.mp4 *.webm *.mov *.mkv *.avi)"
         )
-        filename, _selected = QFileDialog.getOpenFileName(
-            self.window,
-            f"选择 {level} 杀图片或视频",
-            str(Path.home()),
-            filters,
+        filename, _ = QFileDialog.getOpenFileName(
+            self.window, f"选择 {level} 杀图片或视频", str(Path.home()), filters
         )
         if not filename:
             return
-
         try:
             stored = self.asset_service.import_media(Path(filename))
             self.window.set_media_path(level, stored)
@@ -275,15 +374,11 @@ class ApplicationController(QObject):
 
     def choose_sound(self, level: int) -> None:
         filters = "音频文件 (*.wav *.mp3 *.ogg *.flac *.m4a)"
-        filename, _selected = QFileDialog.getOpenFileName(
-            self.window,
-            f"选择 {level} 杀音效",
-            str(Path.home()),
-            filters,
+        filename, _ = QFileDialog.getOpenFileName(
+            self.window, f"选择 {level} 杀音效", str(Path.home()), filters
         )
         if not filename:
             return
-
         try:
             stored = self.asset_service.import_audio(Path(filename))
             self.window.set_sound_path(level, stored)
@@ -296,11 +391,10 @@ class ApplicationController(QObject):
         timestamp = datetime.now().strftime("%H:%M:%S")
         line = f"[{timestamp}] {message}"
         self.window.append_log(line)
-
         log_file = logs_dir() / f"{datetime.now():%Y-%m-%d}.log"
         try:
-            with log_file.open("a", encoding="utf-8") as file:
-                file.write(line + "\n")
+            with log_file.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
         except OSError:
             pass
 
@@ -309,6 +403,8 @@ class ApplicationController(QObject):
         self.app.quit()
 
     def shutdown(self) -> None:
+        self._mouse_worker.stop()
+        self._mouse_loop_timer.stop()
         if self.listener is not None and self.listener.isRunning():
             self.listener.stop()
             self.listener.wait(1200)
