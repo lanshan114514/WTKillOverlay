@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .models import LevelConfig, MouseClickConfig
+from .models import LevelConfig, MouseClickConfig, RandomConfig, RandomPoolItem
 
 
 class PositionEditor(QWidget):
@@ -367,3 +367,277 @@ class MouseClickEditor(QFrame):
     def _clear_sound(self) -> None:
         self.sound_edit.setText("")
         self.changed.emit()
+
+
+class RandomItemEditor(QFrame):
+    """随机池里的一条素材。素材和音效可以只填一样。"""
+
+    changed = Signal()
+    chooseMedia = Signal(object)
+    chooseSound = Signal(object)
+    preview = Signal(object)
+    removeRequested = Signal(object)
+
+    def __init__(self, index: int, config: RandomPoolItem) -> None:
+        super().__init__()
+        self.setObjectName("levelCard")
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+
+        root = QVBoxLayout(self)
+
+        header = QHBoxLayout()
+        self.title = QLabel(f"#{index + 1}")
+        self.title.setObjectName("cardTitle")
+        preview_button = QPushButton("预览")
+        remove_button = QPushButton("删除这条")
+        header.addWidget(self.title)
+        header.addStretch()
+        header.addWidget(preview_button)
+        header.addWidget(remove_button)
+        root.addLayout(header)
+
+        form = QFormLayout()
+
+        media_row = QHBoxLayout()
+        self.media_edit = QLineEdit()
+        self.media_edit.setReadOnly(True)
+        media_button = QPushButton("选择图片/视频")
+        media_clear = QPushButton("清除")
+        media_row.addWidget(self.media_edit, 1)
+        media_row.addWidget(media_button)
+        media_row.addWidget(media_clear)
+        form.addRow("素材", media_row)
+
+        sound_row = QHBoxLayout()
+        self.sound_edit = QLineEdit()
+        self.sound_edit.setReadOnly(True)
+        sound_button = QPushButton("选择音效")
+        sound_clear = QPushButton("清除")
+        sound_row.addWidget(self.sound_edit, 1)
+        sound_row.addWidget(sound_button)
+        sound_row.addWidget(sound_clear)
+        form.addRow("音效", sound_row)
+
+        self.duration = QSpinBox()
+        self.duration.setRange(0, 10000)
+        self.duration.setSuffix(" ms")
+        self.duration.setSpecialValueText("自动")
+        form.addRow("显示时间", self.duration)
+
+        self.volume = QDoubleSpinBox()
+        self.volume.setRange(0.0, 1.0)
+        self.volume.setSingleStep(0.05)
+        self.volume.setDecimals(2)
+        form.addRow("音量", self.volume)
+
+        self.scale = QDoubleSpinBox()
+        self.scale.setRange(0.3, 2.0)
+        self.scale.setSingleStep(0.05)
+        self.scale.setDecimals(2)
+        form.addRow("缩放", self.scale)
+
+        self.chroma = QComboBox()
+        self.chroma.addItem("无", "none")
+        self.chroma.addItem("绿幕", "green")
+        self.chroma.addItem("黑幕", "black")
+        form.addRow("视频抠像", self.chroma)
+
+        self.weight = QDoubleSpinBox()
+        self.weight.setRange(0.0, 20.0)
+        self.weight.setSingleStep(0.5)
+        self.weight.setDecimals(1)
+        self.weight.setToolTip("相对概率。0 表示这条暂时不参与抽取。")
+        form.addRow("权重", self.weight)
+
+        self.min_combo = QSpinBox()
+        self.min_combo.setRange(0, 999)
+        self.min_combo.setSpecialValueText("不限")
+        self.min_combo.setToolTip("连杀数达到这个值之后，这条才参与抽取。")
+        form.addRow("连杀下限", self.min_combo)
+
+        root.addLayout(form)
+        self.set_config(config)
+
+        preview_button.clicked.connect(lambda: self.preview.emit(self))
+        remove_button.clicked.connect(lambda: self.removeRequested.emit(self))
+        media_button.clicked.connect(lambda: self.chooseMedia.emit(self))
+        media_clear.clicked.connect(self._clear_media)
+        sound_button.clicked.connect(lambda: self.chooseSound.emit(self))
+        sound_clear.clicked.connect(self._clear_sound)
+
+        for signal in (
+            self.duration.valueChanged,
+            self.volume.valueChanged,
+            self.scale.valueChanged,
+            self.weight.valueChanged,
+            self.min_combo.valueChanged,
+            self.chroma.currentIndexChanged,
+        ):
+            signal.connect(lambda *_: self.changed.emit())
+
+    def set_title_index(self, index: int) -> None:
+        self.title.setText(f"#{index + 1}")
+
+    def set_config(self, config: RandomPoolItem) -> None:
+        self.media_edit.setText(config.media)
+        self.sound_edit.setText(config.sound)
+        self.duration.setValue(config.duration_ms)
+        self.volume.setValue(config.volume)
+        self.scale.setValue(config.scale)
+        self.weight.setValue(config.weight)
+        self.min_combo.setValue(config.min_combo)
+        index = self.chroma.findData(config.chroma_key)
+        self.chroma.setCurrentIndex(max(index, 0))
+
+    def get_config(self) -> RandomPoolItem:
+        return RandomPoolItem(
+            media=self.media_edit.text().strip(),
+            sound=self.sound_edit.text().strip(),
+            duration_ms=self.duration.value(),
+            volume=self.volume.value(),
+            scale=self.scale.value(),
+            chroma_key=str(self.chroma.currentData()),
+            weight=self.weight.value(),
+            min_combo=self.min_combo.value(),
+        )
+
+    def set_media_path(self, path: str) -> None:
+        self.media_edit.setText(path)
+        self.changed.emit()
+
+    def set_sound_path(self, path: str) -> None:
+        self.sound_edit.setText(path)
+        self.changed.emit()
+
+    def _clear_media(self) -> None:
+        self.media_edit.setText("")
+        self.changed.emit()
+
+    def _clear_sound(self) -> None:
+        self.sound_edit.setText("")
+        self.changed.emit()
+
+
+class RandomPoolEditor(QFrame):
+    """随机播放页：启用开关 + 池子条目列表。"""
+
+    changed = Signal()
+    chooseMedia = Signal(int)
+    chooseSound = Signal(int)
+    preview = Signal(int)
+
+    def __init__(self, config: RandomConfig) -> None:
+        super().__init__()
+        self.setObjectName("levelCard")
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.editors: list[RandomItemEditor] = []
+
+        root = QVBoxLayout(self)
+
+        header = QHBoxLayout()
+        title = QLabel("随机播放")
+        title.setObjectName("cardTitle")
+        self.enabled = QCheckBox("启用（击杀时随机抽取，替代连杀素材）")
+        header.addWidget(title)
+        header.addStretch()
+        header.addWidget(self.enabled)
+        root.addLayout(header)
+
+        tip = QLabel(
+            "池子里放几条素材/音效，每次击杀按权重随机抽一条，连杀数达到【连杀下限】的条目才参与抽取。\n"
+            "素材和音效可以只填一样。权重 0 表示暂时不参与。"
+        )
+        tip.setWordWrap(True)
+        tip.setObjectName("muted")
+        root.addWidget(tip)
+
+        self.avoid_repeat = QCheckBox("避免连续重复：抽到和上一炮同一条时换一条")
+        root.addWidget(self.avoid_repeat)
+
+        self.items_layout = QVBoxLayout()
+        root.addLayout(self.items_layout)
+
+        self.set_config(config)
+
+        self.enabled.toggled.connect(lambda _v: self.changed.emit())
+        self.avoid_repeat.toggled.connect(lambda _v: self.changed.emit())
+
+    def set_config(self, config: RandomConfig) -> None:
+        self.enabled.setChecked(config.enabled)
+        self.avoid_repeat.setChecked(config.avoid_repeat)
+        self.clear_items()
+        for item in config.items:
+            self.add_item(item)
+        if not config.items:
+            self.add_item(RandomPoolItem())
+
+    def get_config(self) -> RandomConfig:
+        return RandomConfig(
+            enabled=self.enabled.isChecked(),
+            items=[editor.get_config() for editor in self.editors],
+            avoid_repeat=self.avoid_repeat.isChecked(),
+        )
+
+    def clear_items(self) -> None:
+        for editor in list(self.editors):
+            self._detach(editor)
+        self.editors.clear()
+
+    def add_item(self, config: RandomPoolItem | None = None) -> RandomItemEditor:
+        editor = RandomItemEditor(len(self.editors), config or RandomPoolItem())
+        editor.changed.connect(self.changed.emit)
+        editor.chooseMedia.connect(self._relay_media)
+        editor.chooseSound.connect(self._relay_sound)
+        editor.preview.connect(self._relay_preview)
+        editor.removeRequested.connect(self._remove_editor)
+        self.items_layout.addWidget(editor)
+        self.editors.append(editor)
+        return editor
+
+    def remove_last(self) -> None:
+        if not self.editors:
+            return
+        self._remove_editor(self.editors[-1])
+
+    def set_media_path(self, index: int, path: str) -> None:
+        if 0 <= index < len(self.editors):
+            self.editors[index].set_media_path(path)
+
+    def set_sound_path(self, index: int, path: str) -> None:
+        if 0 <= index < len(self.editors):
+            self.editors[index].set_sound_path(path)
+
+    def _detach(self, editor: RandomItemEditor) -> None:
+        self.items_layout.removeWidget(editor)
+        editor.setParent(None)  # type: ignore[arg-type]
+        editor.deleteLater()
+
+    def _remove_editor(self, editor: RandomItemEditor) -> None:
+        if editor not in self.editors:
+            return
+        self.editors.remove(editor)
+        self._detach(editor)
+        for position, remaining in enumerate(self.editors):
+            remaining.set_title_index(position)
+        self.changed.emit()
+
+    def _index_of(self, editor: RandomItemEditor) -> int:
+        try:
+            return self.editors.index(editor)
+        except ValueError:
+            return -1
+
+    def _relay_media(self, editor: RandomItemEditor) -> None:
+        index = self._index_of(editor)
+        if index >= 0:
+            self.chooseMedia.emit(index)
+
+    def _relay_sound(self, editor: RandomItemEditor) -> None:
+        index = self._index_of(editor)
+        if index >= 0:
+            self.chooseSound.emit(index)
+
+    def _relay_preview(self, editor: RandomItemEditor) -> None:
+        index = self._index_of(editor)
+        if index >= 0:
+            self.preview.emit(index)

@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
 
 from .models import AppConfig, MouseClickConfig
 from .paths import app_data_dir
-from .widgets import LevelEditor, MouseClickEditor, PositionEditor
+from .widgets import LevelEditor, MouseClickEditor, PositionEditor, RandomPoolEditor
 
 
 class MainWindow(QMainWindow):
@@ -45,6 +45,10 @@ class MainWindow(QMainWindow):
     chooseMouseMediaRequested = Signal()
     chooseMouseSoundRequested = Signal()
     previewMouseClickRequested = Signal()
+    chooseRandomMediaRequested = Signal(int)
+    chooseRandomSoundRequested = Signal(int)
+    previewRandomRequested = Signal(int)
+    importRandomFromLevelsRequested = Signal()
 
     def __init__(self, config: AppConfig) -> None:
         super().__init__()
@@ -62,6 +66,7 @@ class MainWindow(QMainWindow):
         self._build_dashboard()
         self._build_levels()
         self._build_mouse_click()
+        self._build_random()
         self._build_position()
         self._build_settings()
         self._build_logs()
@@ -238,6 +243,53 @@ class MainWindow(QMainWindow):
         scroll.setWidget(container)
         self.tabs.addTab(scroll, "鼠标点击")
 
+    def _build_random(self) -> None:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        container = QWidget()
+        layout = QVBoxLayout(container)
+
+        intro = QLabel(
+            "开启后，击杀时不再按连杀数选档，而是从这个池子里随机抽一条播放。\n"
+            "位置和大小沿用【位置与显示】页的全局设置，可用每条自己的【缩放】微调。"
+        )
+        intro.setWordWrap(True)
+        intro.setObjectName("muted")
+        layout.addWidget(intro)
+
+        self.random_editor = RandomPoolEditor(self.config.random)
+        self.random_editor.changed.connect(self.schedule_save)
+        self.random_editor.chooseMedia.connect(self.chooseRandomMediaRequested.emit)
+        self.random_editor.chooseSound.connect(self.chooseRandomSoundRequested.emit)
+        self.random_editor.preview.connect(self.previewRandomRequested.emit)
+        layout.addWidget(self.random_editor)
+
+        button_row = QHBoxLayout()
+        add_button = QPushButton("＋ 添加一条")
+        remove_button = QPushButton("－ 删除最后一条")
+        import_button = QPushButton("从连杀档位导入")
+        button_row.addWidget(add_button)
+        button_row.addWidget(remove_button)
+        button_row.addWidget(import_button)
+        button_row.addStretch()
+        layout.addLayout(button_row)
+
+        layout.addStretch()
+        scroll.setWidget(container)
+        self.tabs.addTab(scroll, "随机播放")
+
+        add_button.clicked.connect(self._add_random_item)
+        remove_button.clicked.connect(self._remove_random_item)
+        import_button.clicked.connect(self.importRandomFromLevelsRequested.emit)
+
+    def _add_random_item(self) -> None:
+        self.random_editor.add_item()
+        self.schedule_save()
+
+    def _remove_random_item(self) -> None:
+        self.random_editor.remove_last()
+        self.schedule_save()
+
     def _build_position(self) -> None:
         page = QWidget()
         layout = QVBoxLayout(page)
@@ -333,8 +385,11 @@ class MainWindow(QMainWindow):
         self.player_name_edit.setPlaceholderText("填写游戏中显示的完整昵称")
         self.base_url_edit = QLineEdit()
         self.poll_spin = QSpinBox()
-        self.poll_spin.setRange(80, 2000)
+        self.poll_spin.setRange(40, 2000)
         self.poll_spin.setSuffix(" ms")
+        self.poll_spin.setToolTip(
+            "两次轮询之间隔多久。越小反应越快，40 ms 是下限（实测不会拖慢游戏接口）。"
+        )
 
         self.combo_timeout_spin = QSpinBox()
         self.combo_timeout_spin.setRange(500, 30000)
@@ -479,6 +534,7 @@ class MainWindow(QMainWindow):
             self.config.levels[str(level)] = editor.get_config()
 
         self.config.mouse_click = self.mouse_click_editor.get_config()
+        self.config.random = self.random_editor.get_config()
 
         return self.config
 
@@ -523,6 +579,19 @@ class MainWindow(QMainWindow):
 
     def set_mouse_sound_path(self, path: str) -> None:
         self.mouse_click_editor.set_sound_path(path)
+
+    def set_random_media_path(self, index: int, path: str) -> None:
+        self.random_editor.set_media_path(index, path)
+
+    def set_random_sound_path(self, index: int, path: str) -> None:
+        self.random_editor.set_sound_path(index, path)
+
+    def append_random_items(self, items: list[Any]) -> None:
+        for item in items:
+            self.random_editor.add_item(item)
+
+    def set_random_enabled(self, enabled: bool) -> None:
+        self.random_editor.enabled.setChecked(enabled)
 
     # ── 位置编辑 ─────────────────────────────────────────────────────────
 

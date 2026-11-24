@@ -3,11 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 import threading
+import time
 from typing import Any
 import urllib.parse
 import urllib.request
 
 from PySide6.QtCore import QThread, Signal
+
+MIN_POLL_MS = 40    # 轮询节拍的下限：实测 30~45 ms 也不会拖慢游戏的本地接口
 
 
 @dataclass(frozen=True)
@@ -55,6 +58,9 @@ class WarThunderListener(QThread):
             self.connectionChanged.emit(connected, detail)
 
     def run(self) -> None:
+        # 按固定节拍轮询：周期里要扣掉请求本身花掉的时间，
+        # 否则实际节奏是"请求耗时 + 间隔"，白白多等 10 ms 上下。
+        deadline = time.monotonic()
         while not self._stop_event.is_set():
             settings = self._settings_snapshot()
             try:
@@ -68,8 +74,13 @@ class WarThunderListener(QThread):
                 self._last_event_id = 0
                 self._last_damage_id = 0
 
-            interval = max(settings.poll_interval_ms, 80) / 1000
-            self._stop_event.wait(interval)
+            period = max(settings.poll_interval_ms, MIN_POLL_MS) / 1000
+            deadline += period
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                self._stop_event.wait(remaining)
+            else:
+                deadline = time.monotonic()   # 这一轮已经超时，从当下重新对齐
 
         self._set_connected(False, "监听已停止")
 

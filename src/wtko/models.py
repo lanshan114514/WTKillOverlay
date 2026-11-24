@@ -78,6 +78,85 @@ class MouseClickConfig:
     loop_on_hold: bool = True  # 按住时是否循环
 
 
+def _as_int(value: Any, fallback: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _as_float(value: Any, fallback: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _as_str(value: Any, fallback: str) -> str:
+    if value is None:
+        return fallback
+    return str(value)
+
+
+@dataclass
+class RandomPoolItem:
+    """随机池中的一条：素材和音效都可留空，至少要有一样。
+
+    min_combo 表示"连杀数达到多少才开始参与抽取"，用来实现连杀加权：
+    低档条目下限设 0 永远参与，高档条目下限设高，连杀起来后自然挤占份额。
+    """
+
+    media: str = ""
+    sound: str = ""
+    duration_ms: int = 0
+    volume: float = 0.9
+    scale: float = 1.0
+    chroma_key: str = "none"
+    weight: float = 1.0
+    min_combo: int = 0
+
+    def is_usable(self) -> bool:
+        return bool(self.media or self.sound) and self.weight > 0
+
+    def identity(self) -> str:
+        return f"{self.media}|{self.sound}"
+
+
+@dataclass
+class RandomConfig:
+    """随机播放配置。启用后击杀不再按连杀数选档，而是从池中抽取。"""
+
+    enabled: bool = False
+    items: list[RandomPoolItem] = field(default_factory=list)
+    avoid_repeat: bool = True
+
+
+def _load_random(raw: dict[str, Any]) -> RandomConfig:
+    items: list[RandomPoolItem] = []
+    raw_items = raw.get("items", [])
+    if isinstance(raw_items, list):
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            items.append(
+                RandomPoolItem(
+                    media=_as_str(item.get("media"), ""),
+                    sound=_as_str(item.get("sound"), ""),
+                    duration_ms=_as_int(item.get("duration_ms"), 0),
+                    volume=_as_float(item.get("volume"), 0.9),
+                    scale=_as_float(item.get("scale"), 1.0),
+                    chroma_key=_as_str(item.get("chroma_key"), "none"),
+                    weight=_as_float(item.get("weight"), 1.0),
+                    min_combo=_as_int(item.get("min_combo"), 0),
+                )
+            )
+    return RandomConfig(
+        enabled=bool(raw.get("enabled", False)),
+        items=items,
+        avoid_repeat=bool(raw.get("avoid_repeat", True)),
+    )
+
+
 def _load_level(raw: dict[str, Any], base: LevelConfig) -> LevelConfig:
     return LevelConfig(
         enabled=bool(raw.get("enabled", base.enabled)),
@@ -100,6 +179,7 @@ class AppConfig:
     general: GeneralConfig = field(default_factory=GeneralConfig)
     levels: dict[str, LevelConfig] = field(default_factory=dict)
     mouse_click: MouseClickConfig = field(default_factory=MouseClickConfig)
+    random: RandomConfig = field(default_factory=RandomConfig)
 
     @staticmethod
     def from_dict(raw: dict[str, Any]) -> "AppConfig":
@@ -125,6 +205,7 @@ class AppConfig:
         overlay_raw = raw.get("overlay", {})
         general_raw = raw.get("general", {})
         mc_raw = raw.get("mouse_click", {})
+        random_raw = raw.get("random", {})
         mc_base = defaults.mouse_click
 
         return AppConfig(
@@ -185,6 +266,7 @@ class AppConfig:
                 ),
             ),
             levels=levels,
+            random=_load_random(random_raw) if isinstance(random_raw, dict) else RandomConfig(),
             mouse_click=MouseClickConfig(
                 enabled=bool(mc_raw.get("enabled", mc_base.enabled)),
                 media=str(mc_raw.get("media", mc_base.media)),

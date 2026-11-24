@@ -35,7 +35,9 @@ class ConfigManager:
             return config
 
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            # utf-8-sig：兼容被记事本/PowerShell 加了 BOM 的配置文件，
+            # 否则 json.loads 会直接失败、被当成坏配置回退成默认值
+            raw = json.loads(self.path.read_text(encoding="utf-8-sig"))
             if not isinstance(raw, dict):
                 raise ValueError("配置根节点必须是对象")
             return AppConfig.from_dict(raw)

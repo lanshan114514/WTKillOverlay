@@ -14,13 +14,16 @@ from PySide6.QtWidgets import (
 )
 
 from .assets import AssetService
+from .audio_engine import AudioEngine
 from .config import ConfigManager
 from .listener import ListenerSettings, WarThunderListener
 from .main_window import MainWindow
 from .media import AudioPlayer
+from .models import RandomPoolItem
 from .mouse_listener import MouseClickWorker
 from .overlay import OverlayWindow
 from .paths import config_path, logs_dir, resolve_data_path, resource_path
+from .picker import pick_item
 
 
 class ApplicationController(QObject):
@@ -35,11 +38,14 @@ class ApplicationController(QObject):
         self.window = MainWindow(self.config)
         self.overlay = OverlayWindow()
         self.audio = AudioPlayer(self)
+        # 常驻流混音器；打不开设备时自动回退到上面的 AudioPlayer
+        self.audio_engine = AudioEngine(self)
         self.listener: WarThunderListener | None = None
 
         self.combo_count = 0
         self.last_kill_time = 0.0
         self.sequence_level = 0
+        self._last_random_identity = ""
 
         # 鼠标点击状态
         self._mouse_holding = False
@@ -60,11 +66,46 @@ class ApplicationController(QObject):
         self.log("程序已启动。")
         self.log(f"数据目录：{config_path().parent}")
 
+        self.audio_engine.stateChanged.connect(self._on_audio_ready)
+        self.audio_engine.start()
+        self._preload_sounds()
+
         if self.config.general.start_listening_on_launch:
             QTimer.singleShot(300, self.start_listener)
 
         # 鼠标监听始终启动（不需要 WT 连接）
         self._mouse_worker.start()
+
+    def _on_audio_ready(self, ok: bool, detail: str) -> None:
+        if ok:
+            self.log(f"音频引擎就绪：{detail}")
+        else:
+            self.log(f"音频引擎不可用（回退到旧播放器）：{detail}")
+
+    def _preload_sounds(self) -> None:
+        paths: list[Path] = []
+        for level in self.config.levels.values():
+            if level.sound:
+                paths.append(resolve_data_path(level.sound))
+        for item in self.config.random.items:
+            if item.sound:
+                paths.append(resolve_data_path(item.sound))
+        if self.config.mouse_click.sound:
+            paths.append(resolve_data_path(self.config.mouse_click.sound))
+        self.audio_engine.preload(paths)
+
+    def _play_sound(self, path: Path, volume: float) -> None:
+        """立刻起声，不排队、不故意错开。
+
+        密集连杀时靠音频引擎的侧链闪避把新一炮的起声顶出来，
+        这里不再人为拉开间隔。
+        """
+        self._emit_sound(path, volume)
+
+    def _emit_sound(self, path: Path, volume: float) -> None:
+        if self.audio_engine.is_ready() and self.audio_engine.play(path, volume):
+            return
+        self.audio.play(path, volume)
 
     def _connect_signals(self) -> None:
         self.window.startRequested.connect(self.start_listener)
@@ -79,6 +120,10 @@ class ApplicationController(QObject):
         self.window.chooseMouseMediaRequested.connect(self.choose_mouse_media)
         self.window.chooseMouseSoundRequested.connect(self.choose_mouse_sound)
         self.window.previewMouseClickRequested.connect(self._play_mouse_click_once)
+        self.window.chooseRandomMediaRequested.connect(self.choose_random_media)
+        self.window.chooseRandomSoundRequested.connect(self.choose_random_sound)
+        self.window.previewRandomRequested.connect(self.preview_random)
+        self.window.importRandomFromLevelsRequested.connect(self.import_random_from_levels)
 
         self.overlay.playbackFailed.connect(
             lambda text: self.log(f"播放失败：{text}")
@@ -220,11 +265,153 @@ class ApplicationController(QObject):
 
         self.last_kill_time = now
         self.window.update_combo_display(self.combo_count)
+
+        if self._random_mode_active():
+            self._play_random()
+            return
+
         resolved = self.resolve_level(self.combo_count)
         self.log(
             f"检测到本人击杀，当前连杀 {self.combo_count}，使用 {resolved} 杀素材。"
         )
         self.play_level(resolved)
+
+    # ── 随机播放 ─────────────────────────────────────────────────────────
+
+    def _random_mode_active(self) -> bool:
+        config = self.config.random
+        return config.enabled and any(item.is_usable() for item in config.items)
+
+    def _play_random(self) -> None:
+        self.config = self.window.apply_controls_to_config()
+        item = pick_item(
+            self.config.random.items,
+            self.combo_count,
+            last_identity=self._last_random_identity,
+            avoid_repeat=self.config.random.avoid_repeat,
+        )
+
+        if item is None:
+            self.log("随机池没有可用条目，回退到按连杀数播放。")
+            self._last_random_identity = ""
+            self.play_level(self.resolve_level(self.combo_count))
+            return
+
+        self._last_random_identity = item.identity()
+        name = Path(item.media or item.sound).name
+        self.log(f"随机播放：{name}（当前连杀 {self.combo_count}）")
+
+        if item.media:
+            self.overlay.play_generic(
+                media=item.media,
+                duration_ms=item.duration_ms,
+                chroma_key=item.chroma_key,
+                scale=item.scale,
+                overlay_config=self.config.overlay,
+            )
+        if item.sound:
+            self._play_sound(resolve_data_path(item.sound), item.volume)
+
+    def preview_random(self, index: int) -> None:
+        self.config = self.window.apply_controls_to_config()
+        items = self.config.random.items
+        if not 0 <= index < len(items):
+            return
+        item = items[index]
+        if not item.is_usable():
+            self.log("这条随机素材还没设置内容。")
+            return
+        self.log(f"手动预览随机素材：{Path(item.media or item.sound).name}")
+        if item.media:
+            self.overlay.play_generic(
+                media=item.media,
+                duration_ms=item.duration_ms,
+                chroma_key=item.chroma_key,
+                scale=item.scale,
+                overlay_config=self.config.overlay,
+            )
+        if item.sound:
+            self._play_sound(resolve_data_path(item.sound), item.volume)
+
+    def choose_random_media(self, index: int) -> None:
+        filters = (
+            "媒体文件 (*.png *.jpg *.jpeg *.bmp *.webp *.gif "
+            "*.mp4 *.webm *.mov *.mkv *.avi)"
+        )
+        filename, _ = QFileDialog.getOpenFileName(
+            self.window, "选择随机素材图片或视频", str(Path.home()), filters
+        )
+        if not filename:
+            return
+        try:
+            stored = self.asset_service.import_media(Path(filename))
+            self.window.set_random_media_path(index, stored)
+            self.save_config()
+            self.log(f"已导入随机素材：{stored}")
+        except Exception as exc:
+            self.window.show_error("素材导入失败", str(exc))
+
+    def choose_random_sound(self, index: int) -> None:
+        filters = "音频文件 (*.wav *.mp3 *.ogg *.flac *.m4a)"
+        filename, _ = QFileDialog.getOpenFileName(
+            self.window, "选择随机音效", str(Path.home()), filters
+        )
+        if not filename:
+            return
+        try:
+            stored = self.asset_service.import_audio(Path(filename))
+            self.window.set_random_sound_path(index, stored)
+            self.save_config()
+            self.log(f"已导入随机音效：{stored}")
+        except Exception as exc:
+            self.window.show_error("音效导入失败", str(exc))
+
+    def import_random_from_levels(self) -> None:
+        self.config = self.window.apply_controls_to_config()
+        was_empty = not any(item.is_usable() for item in self.config.random.items)
+        existing = {item.identity() for item in self.config.random.items}
+
+        imported: list[RandomPoolItem] = []
+        skipped = 0
+        for key in sorted(
+            (k for k in self.config.levels if k.isdigit()), key=int
+        ):
+            level = self.config.levels[key]
+            if not (level.media or level.sound):
+                continue
+            item = RandomPoolItem(
+                media=level.media,
+                sound=level.sound,
+                duration_ms=level.duration_ms,
+                volume=level.volume,
+                scale=level.scale,
+                chroma_key=level.chroma_key,
+                weight=1.0,
+                min_combo=0,
+            )
+            if item.identity() in existing:
+                skipped += 1
+                continue
+            existing.add(item.identity())
+            imported.append(item)
+
+        if not imported:
+            self.log(
+                f"没有可导入的新条目（{skipped} 条已在池子里）。"
+                if skipped
+                else "连杀档位里没有已设置的素材，无可导入内容。"
+            )
+            return
+
+        self.window.append_random_items(imported)
+        if was_empty:
+            self.window.set_random_enabled(True)
+        self.save_config()
+        self.log(
+            f"已从连杀档位导入 {len(imported)} 条到随机池"
+            f"{f'，跳过 {skipped} 条重复' if skipped else ''}"
+            f"{'，并自动开启随机播放' if was_empty else ''}。"
+        )
 
     def reset_combo(self) -> None:
         self.combo_count = 0
@@ -255,7 +442,7 @@ class ApplicationController(QObject):
             return
         self.overlay.play_level(level, level_config, self.config.overlay)
         if level_config.sound:
-            self.audio.play(resolve_data_path(level_config.sound), level_config.volume)
+            self._play_sound(resolve_data_path(level_config.sound), level_config.volume)
 
     def preview_level(self, level: int) -> None:
         self.log(f"手动预览 {level} 杀。")
@@ -317,7 +504,7 @@ class ApplicationController(QObject):
             overlay_config=self.config.overlay,
         )
         if mc.sound:
-            self.audio.play(resolve_data_path(mc.sound), mc.volume)
+            self._play_sound(resolve_data_path(mc.sound), mc.volume)
 
     def choose_mouse_media(self) -> None:
         filters = (
@@ -408,6 +595,7 @@ class ApplicationController(QObject):
         if self.listener is not None and self.listener.isRunning():
             self.listener.stop()
             self.listener.wait(1200)
+        self.audio_engine.shutdown()
         self.audio.stop()
         self.overlay.close_overlay()
         self.tray.hide()
